@@ -221,32 +221,41 @@ TEST_CASE("Test map handler")
 		REQUIRE((map.map_delete_elem(nullptr) < 0 && errno == ENOTSUP));
 		REQUIRE((map.bpf_map_get_next_key(nullptr, nullptr) < 0 &&
 			 errno == ENOTSUP));
-		auto impl = map.try_get_ringbuf_map_impl()
-				    .value()
-				    ->create_impl_shared_ptr();
-		std::vector<std::thread> thds;
-		thds.push_back(std::thread([=]() {
-			for (int i = 1; i <= 100; i++) {
-				void *ptr = impl->reserve(sizeof(int), 1);
-				REQUIRE(ptr != nullptr);
-				memcpy(ptr, &i, sizeof(int));
-				impl->submit(ptr, i % 2 == 0);
-			}
-		}));
-		thds.push_back(std::thread([=]() {
-			std::vector<int> data;
-			while (data.size() < 50) {
-				impl->fetch_data([&](void *buf, int len) {
-					REQUIRE(len == sizeof(int));
-					data.push_back(*(int *)buf);
-					return 0;
-				});
-			}
-			for (int i = 0; i < (int)data.size(); i++)
-				REQUIRE(data[i] == 2 * i + 1);
-		}));
-		for (auto &thd : thds)
-			thd.join();
+		{
+			auto impl = map.try_get_ringbuf_map_impl()
+					    .value()
+					    ->create_impl_shared_ptr();
+			std::vector<std::thread> thds;
+			thds.push_back(std::thread([=]() {
+				for (int i = 1; i <= 100; i++) {
+					void *ptr =
+						impl->reserve(sizeof(int), 1);
+					REQUIRE(ptr != nullptr);
+					memcpy(ptr, &i, sizeof(int));
+					impl->submit(ptr, i % 2 == 0);
+				}
+			}));
+			thds.push_back(std::thread([=]() {
+				std::vector<int> data;
+				while (data.size() < 50) {
+					impl->fetch_data([&](void *buf,
+							     int len) {
+						REQUIRE(len == sizeof(int));
+						data.push_back(*(int *)buf);
+						return 0;
+					});
+				}
+				for (int i = 0; i < (int)data.size(); i++)
+					REQUIRE(data[i] == 2 * i + 1);
+			}));
+			for (auto &thd : thds)
+				thd.join();
+		}
+		auto weak_ptr = map.try_get_ringbuf_map_impl()
+					.value()
+					->create_impl_weak_ptr();
+
 		manager_ref.clear_id_at(1, segment);
+		REQUIRE(weak_ptr.lock() == nullptr);
 	}
 }
