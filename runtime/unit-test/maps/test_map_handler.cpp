@@ -122,9 +122,17 @@ TEST_CASE("Test map handler")
 				REQUIRE(map.get_value_size() ==
 					expected_value_size);
 			}
-			int32_t key = 233;
+			int32_t key = 0;
 			uint64_t value = 666;
 			REQUIRE(map.map_update_elem(&key, &value, 0, false) ==
+				0);
+			key = 1;
+			REQUIRE(map.map_update_elem(&key, &value, 0, false) ==
+				0);
+			int32_t next_key = 0;
+			int32_t test_key = 21000;
+
+			REQUIRE(map.bpf_map_get_next_key(nullptr, &next_key) ==
 				0);
 			if (map_type.is_per_cpu) {
 				auto valueptr = (uint64_t *)map.map_lookup_elem(
