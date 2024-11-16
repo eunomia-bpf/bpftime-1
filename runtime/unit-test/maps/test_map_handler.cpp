@@ -7,10 +7,13 @@
 #include <boost/interprocess/creation_tags.hpp>
 #include <boost/interprocess/interprocess_fwd.hpp>
 #include <boost/interprocess/managed_shared_memory.hpp>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <handler/handler_manager.hpp>
 #include <handler/map_handler.hpp>
 #include <optional>
+#include <thread>
 #include <unistd.h>
 
 using boost::interprocess::managed_shared_memory;
@@ -69,101 +72,181 @@ TEST_CASE("Test map handler")
 	auto manager = segment.construct<bpftime::handler_manager>(
 		"handler_manager")(segment);
 	auto &manager_ref = *manager;
-	for (auto map_type : testable_maps) {
-		SPDLOG_INFO("Testing map type {}", (int)map_type.map_type);
-		const uint32_t expected_value_size =
-			map_type.value_size_hack.value_or(8);
-		struct kernel_map_tuple {
-			uint32_t id;
-			int fd;
-		};
-		std::optional<kernel_map_tuple> kernel_map_info;
-		if (map_type.kernel_map_type) {
-			LIBBPF_OPTS(bpf_map_create_opts, opts);
-			opts.map_flags = map_type.extra_flags;
-			int fd = bpf_map_create(
-				(enum bpf_map_type)
-					map_type.kernel_map_type.value(),
-				"test_map", 4, expected_value_size, 1024,
-				&opts);
-			REQUIRE(fd > 0);
-			struct bpf_map_info info;
-			uint32_t len = sizeof(info);
-			REQUIRE(bpf_map_get_info_by_fd(fd, &info, &len) == 0);
-			kernel_map_info = {
-				.id = info.id,
-				.fd = fd,
+
+	SECTION("Test good operations")
+	{
+		for (auto map_type : testable_maps) {
+			SPDLOG_INFO("Testing map type {}",
+				    (int)map_type.map_type);
+			const uint32_t expected_value_size =
+				map_type.value_size_hack.value_or(8);
+			struct kernel_map_tuple {
+				uint32_t id;
+				int fd;
 			};
-			SPDLOG_INFO("Created kernel map, fd={}, id={}", fd,
-				    info.id);
+			std::optional<kernel_map_tuple> kernel_map_info;
+			if (map_type.kernel_map_type) {
+				LIBBPF_OPTS(bpf_map_create_opts, opts);
+				opts.map_flags = map_type.extra_flags;
+				int fd = bpf_map_create(
+					(enum bpf_map_type)map_type
+						.kernel_map_type.value(),
+					"test_map", 4, expected_value_size,
+					1024, &opts);
+				REQUIRE(fd > 0);
+				struct bpf_map_info info;
+				uint32_t len = sizeof(info);
+				REQUIRE(bpf_map_get_info_by_fd(fd, &info,
+							       &len) == 0);
+				kernel_map_info = {
+					.id = info.id,
+					.fd = fd,
+				};
+				SPDLOG_INFO("Created kernel map, fd={}, id={}",
+					    fd, info.id);
+			}
+			manager_ref.set_handler(
+				1,
+				bpftime::bpf_map_handler(
+					1, "test_map", segment,
+					bpftime::bpf_map_attr{
+						.type = (int)map_type.map_type,
+						.key_size = 4,
+						.value_size =
+							expected_value_size,
+						.max_ents = 1024,
+						.kernel_bpf_map_id =
+							kernel_map_info ?
+								kernel_map_info
+									->id :
+								0 }),
+				segment);
+
+			auto &map = std::get<bpftime::bpf_map_handler>(
+				manager_ref[1]);
+
+			if (!map_type.create_only) {
+				if (map_type.is_per_cpu) {
+					REQUIRE(map.get_value_size() ==
+						(uint32_t)expected_value_size *
+							ncpu);
+				} else {
+					REQUIRE(map.get_value_size() ==
+						expected_value_size);
+				}
+				int32_t key = 0;
+				uint64_t value = 666;
+				REQUIRE(map.map_update_elem(&key, &value, 0,
+							    false) == 0);
+				key = 1;
+				REQUIRE(map.map_update_elem(&key, &value, 0,
+							    false) == 0);
+				int32_t next_key = 0;
+				int32_t test_key = 21000;
+
+				REQUIRE(map.bpf_map_get_next_key(
+						nullptr, &next_key) == 0);
+				if (map_type.is_per_cpu) {
+					auto valueptr =
+						(uint64_t *)map.map_lookup_elem(
+							&key, true);
+					REQUIRE(valueptr != nullptr);
+					bool found = false;
+					for (int i = 0; i < ncpu; i++) {
+						if (valueptr[i] == value) {
+							found = true;
+							break;
+						}
+					}
+					REQUIRE(found);
+				} else {
+					auto valueptr = map.map_lookup_elem(
+						&key, false);
+					REQUIRE(valueptr != nullptr);
+					REQUIRE(*(uint64_t *)valueptr == value);
+				}
+				if (map_type.can_delete) {
+					REQUIRE(map.map_delete_elem(&key) == 0);
+					if (!map_type.is_per_cpu) {
+						auto valueptr =
+							map.map_lookup_elem(
+								&key, false);
+						REQUIRE(valueptr == nullptr);
+					}
+				}
+			}
+			manager_ref.clear_id_at(1, segment);
+			if (kernel_map_info) {
+				close(kernel_map_info->id);
+			}
 		}
+	}
+	SECTION("Test bad map types")
+	{
+		manager_ref.set_handler(
+			1,
+			bpftime::bpf_map_handler(
+				1, "test_map", segment,
+				bpftime::bpf_map_attr{ .type = (int)-1,
+						       .key_size = 4,
+						       .value_size = 8,
+						       .max_ents = 1024 }),
+			segment);
+		auto &map = std::get<bpftime::bpf_map_handler>(manager_ref[1]);
+
+		REQUIRE(map.map_update_elem(nullptr, nullptr, 0) < 0);
+		REQUIRE(map.map_lookup_elem(nullptr) == nullptr);
+		REQUIRE(map.map_delete_elem(nullptr) < 0);
+		REQUIRE(map.bpf_map_get_next_key(nullptr, nullptr) < 0);
+		manager_ref.clear_id_at(1, segment);
+	}
+	SECTION("Test ringbuf")
+	{
 		manager_ref.set_handler(
 			1,
 			bpftime::bpf_map_handler(
 				1, "test_map", segment,
 				bpftime::bpf_map_attr{
-					.type = (int)map_type.map_type,
+					.type = (int)bpftime::bpf_map_type::
+						BPF_MAP_TYPE_RINGBUF,
 					.key_size = 4,
-					.value_size = expected_value_size,
-					.max_ents = 1024,
-					.kernel_bpf_map_id =
-						kernel_map_info ?
-							kernel_map_info->id :
-							0 }),
+					.value_size = 8,
+					.max_ents = 1 << 20 }),
 			segment);
-
 		auto &map = std::get<bpftime::bpf_map_handler>(manager_ref[1]);
-
-		if (!map_type.create_only) {
-			if (map_type.is_per_cpu) {
-				REQUIRE(map.get_value_size() ==
-					(uint32_t)expected_value_size * ncpu);
-			} else {
-				REQUIRE(map.get_value_size() ==
-					expected_value_size);
+		REQUIRE((map.map_lookup_elem(nullptr) == nullptr &&
+			 errno == ENOTSUP));
+		REQUIRE((map.map_update_elem(nullptr, nullptr, 0) < 0 &&
+			 errno == ENOTSUP));
+		REQUIRE((map.map_delete_elem(nullptr) < 0 && errno == ENOTSUP));
+		REQUIRE((map.bpf_map_get_next_key(nullptr, nullptr) < 0 &&
+			 errno == ENOTSUP));
+		auto impl = map.try_get_ringbuf_map_impl()
+				    .value()
+				    ->create_impl_shared_ptr();
+		std::vector<std::thread> thds;
+		thds.push_back(std::thread([=]() {
+			for (int i = 1; i <= 100; i++) {
+				void *ptr = impl->reserve(sizeof(int), 1);
+				REQUIRE(ptr != nullptr);
+				memcpy(ptr, &i, sizeof(int));
+				impl->submit(ptr, i % 2 == 0);
 			}
-			int32_t key = 0;
-			uint64_t value = 666;
-			REQUIRE(map.map_update_elem(&key, &value, 0, false) ==
-				0);
-			key = 1;
-			REQUIRE(map.map_update_elem(&key, &value, 0, false) ==
-				0);
-			int32_t next_key = 0;
-			int32_t test_key = 21000;
-
-			REQUIRE(map.bpf_map_get_next_key(nullptr, &next_key) ==
-				0);
-			if (map_type.is_per_cpu) {
-				auto valueptr = (uint64_t *)map.map_lookup_elem(
-					&key, true);
-				REQUIRE(valueptr != nullptr);
-				bool found = false;
-				for (int i = 0; i < ncpu; i++) {
-					if (valueptr[i] == value) {
-						found = true;
-						break;
-					}
-				}
-				REQUIRE(found);
-			} else {
-				auto valueptr =
-					map.map_lookup_elem(&key, false);
-				REQUIRE(valueptr != nullptr);
-				REQUIRE(*(uint64_t *)valueptr == value);
+		}));
+		thds.push_back(std::thread([=]() {
+			std::vector<int> data;
+			while (data.size() < 50) {
+				impl->fetch_data([&](void *buf, int len) {
+					REQUIRE(len == sizeof(int));
+					data.push_back(*(int *)buf);
+					return 0;
+				});
 			}
-			if (map_type.can_delete) {
-				REQUIRE(map.map_delete_elem(&key) == 0);
-				if (!map_type.is_per_cpu) {
-					auto valueptr = map.map_lookup_elem(
-						&key, false);
-					REQUIRE(valueptr == nullptr);
-				}
-			}
-		}
+			for (int i = 0; i < (int)data.size(); i++)
+				REQUIRE(data[i] == 2 * i + 1);
+		}));
+		for (auto &thd : thds)
+			thd.join();
 		manager_ref.clear_id_at(1, segment);
-		if (kernel_map_info) {
-			close(kernel_map_info->id);
-		}
 	}
 }
