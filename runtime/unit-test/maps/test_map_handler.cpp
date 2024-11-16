@@ -23,6 +23,8 @@ struct testable_map_def {
 	bool is_per_cpu = false;
 	uint64_t extra_flags = 0;
 	bool can_delete = true;
+	bool create_only = false;
+	std::optional<uint32_t> value_size_hack;
 };
 
 static testable_map_def testable_maps[] = {
@@ -42,6 +44,19 @@ static testable_map_def testable_maps[] = {
 	  .can_delete = false },
 	{ .map_type = bpftime::bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_HASH,
 	  .kernel_map_type = BPF_MAP_TYPE_HASH },
+	{ .map_type = bpftime::bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+	  .create_only = true,
+	  .value_size_hack = 4 },
+	{ .map_type = bpftime::bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+	  .create_only = true,
+	  .value_size_hack = 4 },
+
+	{ .map_type = bpftime::bpf_map_type::BPF_MAP_TYPE_PROG_ARRAY,
+	  .create_only = true,
+	  .value_size_hack = 4 },
+	{ .map_type = bpftime::bpf_map_type::BPF_MAP_TYPE_ARRAY_OF_MAPS,
+	  .create_only = true },
+
 };
 
 TEST_CASE("Test map handler")
@@ -56,6 +71,8 @@ TEST_CASE("Test map handler")
 	auto &manager_ref = *manager;
 	for (auto map_type : testable_maps) {
 		SPDLOG_INFO("Testing map type {}", (int)map_type.map_type);
+		const uint32_t expected_value_size =
+			map_type.value_size_hack.value_or(8);
 		struct kernel_map_tuple {
 			uint32_t id;
 			int fd;
@@ -67,7 +84,8 @@ TEST_CASE("Test map handler")
 			int fd = bpf_map_create(
 				(enum bpf_map_type)
 					map_type.kernel_map_type.value(),
-				"test_map", 4, 8, 1024, &opts);
+				"test_map", 4, expected_value_size, 1024,
+				&opts);
 			REQUIRE(fd > 0);
 			struct bpf_map_info info;
 			uint32_t len = sizeof(info);
@@ -86,7 +104,7 @@ TEST_CASE("Test map handler")
 				bpftime::bpf_map_attr{
 					.type = (int)map_type.map_type,
 					.key_size = 4,
-					.value_size = 8,
+					.value_size = expected_value_size,
 					.max_ents = 1024,
 					.kernel_bpf_map_id =
 						kernel_map_info ?
@@ -95,37 +113,44 @@ TEST_CASE("Test map handler")
 			segment);
 
 		auto &map = std::get<bpftime::bpf_map_handler>(manager_ref[1]);
-		if (map_type.is_per_cpu) {
-			REQUIRE(map.get_value_size() == (uint32_t)8 * ncpu);
-		} else {
-			REQUIRE(map.get_value_size() == 8);
-		}
-		int32_t key = 233;
-		uint64_t value = 666;
-		REQUIRE(map.map_update_elem(&key, &value, 0, false) == 0);
-		if (map_type.is_per_cpu) {
-			auto valueptr =
-				(uint64_t *)map.map_lookup_elem(&key, true);
-			REQUIRE(valueptr != nullptr);
-			bool found = false;
-			for (int i = 0; i < ncpu; i++) {
-				if (valueptr[i] == value) {
-					found = true;
-					break;
-				}
+
+		if (!map_type.create_only) {
+			if (map_type.is_per_cpu) {
+				REQUIRE(map.get_value_size() ==
+					(uint32_t)expected_value_size * ncpu);
+			} else {
+				REQUIRE(map.get_value_size() ==
+					expected_value_size);
 			}
-			REQUIRE(found);
-		} else {
-			auto valueptr = map.map_lookup_elem(&key, false);
-			REQUIRE(valueptr != nullptr);
-			REQUIRE(*(uint64_t *)valueptr == value);
-		}
-		if (map_type.can_delete) {
-			REQUIRE(map.map_delete_elem(&key) == 0);
-			if (!map_type.is_per_cpu) {
+			int32_t key = 233;
+			uint64_t value = 666;
+			REQUIRE(map.map_update_elem(&key, &value, 0, false) ==
+				0);
+			if (map_type.is_per_cpu) {
+				auto valueptr = (uint64_t *)map.map_lookup_elem(
+					&key, true);
+				REQUIRE(valueptr != nullptr);
+				bool found = false;
+				for (int i = 0; i < ncpu; i++) {
+					if (valueptr[i] == value) {
+						found = true;
+						break;
+					}
+				}
+				REQUIRE(found);
+			} else {
 				auto valueptr =
 					map.map_lookup_elem(&key, false);
-				REQUIRE(valueptr == nullptr);
+				REQUIRE(valueptr != nullptr);
+				REQUIRE(*(uint64_t *)valueptr == value);
+			}
+			if (map_type.can_delete) {
+				REQUIRE(map.map_delete_elem(&key) == 0);
+				if (!map_type.is_per_cpu) {
+					auto valueptr = map.map_lookup_elem(
+						&key, false);
+					REQUIRE(valueptr == nullptr);
+				}
 			}
 		}
 		manager_ref.clear_id_at(1, segment);
