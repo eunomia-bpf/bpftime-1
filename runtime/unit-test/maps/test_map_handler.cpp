@@ -1,6 +1,7 @@
 #include "bpf/bpf.h"
 #include "bpf/libbpf_common.h"
 #include "bpftime_shm.hpp"
+#include "bpftime_shm_internal.hpp"
 #include "catch2/catch_test_macros.hpp"
 #include "linux/bpf.h"
 #include "spdlog/spdlog.h"
