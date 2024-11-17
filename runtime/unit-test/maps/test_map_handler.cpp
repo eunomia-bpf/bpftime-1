@@ -63,16 +63,28 @@ static testable_map_def testable_maps[] = {
 
 };
 
+extern "C" {
+uint64_t bpf_ringbuf_discard(uint64_t data, uint64_t flags, uint64_t, uint64_t,
+			     uint64_t);
+uint64_t bpf_ringbuf_submit(uint64_t data, uint64_t flags, uint64_t, uint64_t,
+			    uint64_t);
+uint64_t bpf_ringbuf_reserve(uint64_t rb, uint64_t size, uint64_t flags,
+			     uint64_t, uint64_t);
+uint64_t bpf_ringbuf_output(uint64_t rb, uint64_t data, uint64_t size,
+			    uint64_t flags, uint64_t);
+}
+
 TEST_CASE("Test map handler")
 {
 	struct bpftime::shm_remove remover(SHM_NAME);
 	int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 
-	managed_shared_memory segment(boost::interprocess::create_only,
-				      SHM_NAME, 20 << 20);
-	auto manager = segment.construct<bpftime::handler_manager>(
-		"handler_manager")(segment);
-	auto &manager_ref = *manager;
+	bpftime_initialize_global_shm(
+		bpftime::shm_open_type::SHM_REMOVE_AND_CREATE);
+	auto &shm = bpftime::shm_holder.global_shared_memory;
+
+	auto &manager_ref = shm.get_manager_mut();
+	auto &segment = shm.get_segment_manager();
 
 	SECTION("Test good operations")
 	{
@@ -203,17 +215,14 @@ TEST_CASE("Test map handler")
 	}
 	SECTION("Test ringbuf")
 	{
-		manager_ref.set_handler(
-			1,
-			bpftime::bpf_map_handler(
-				1, "test_map", segment,
+		shm.add_bpf_map(1, "test_map",
+
 				bpftime::bpf_map_attr{
 					.type = (int)bpftime::bpf_map_type::
 						BPF_MAP_TYPE_RINGBUF,
 					.key_size = 4,
 					.value_size = 8,
-					.max_ents = 1 << 20 }),
-			segment);
+					.max_ents = 1 << 20 });
 		auto &map = std::get<bpftime::bpf_map_handler>(manager_ref[1]);
 		REQUIRE((map.map_lookup_elem(nullptr) == nullptr &&
 			 errno == ENOTSUP));
@@ -223,19 +232,32 @@ TEST_CASE("Test map handler")
 		REQUIRE((map.bpf_map_get_next_key(nullptr, nullptr) < 0 &&
 			 errno == ENOTSUP));
 		{
-			auto impl = map.try_get_ringbuf_map_impl()
-					    .value()
-					    ->create_impl_shared_ptr();
+			auto rb_ptr = ((uint64_t)1 << 32);
 			std::vector<std::thread> thds;
 			thds.push_back(std::thread([=]() {
 				for (int i = 1; i <= 100; i++) {
-					void *ptr =
-						impl->reserve(sizeof(int), 1);
+					void *ptr = (void *)(uintptr_t)
+						bpf_ringbuf_reserve(rb_ptr,
+								    sizeof(int),
+								    0, 0, 0);
 					REQUIRE(ptr != nullptr);
 					memcpy(ptr, &i, sizeof(int));
-					impl->submit(ptr, i % 2 == 0);
+					if (i % 2 == 0) {
+						// discard it
+						bpf_ringbuf_discard(
+							(uintptr_t)ptr, 0, 0, 0,
+							0);
+					} else {
+						// submit it
+						bpf_ringbuf_submit(
+							(uintptr_t)ptr, 0, 0, 0,
+							0);
+					}
 				}
 			}));
+			auto impl = map.try_get_ringbuf_map_impl()
+					    .value()
+					    ->create_impl_shared_ptr();
 			thds.push_back(std::thread([=]() {
 				std::vector<int> data;
 				while (data.size() < 50) {
@@ -257,6 +279,7 @@ TEST_CASE("Test map handler")
 					->create_impl_weak_ptr();
 
 		manager_ref.clear_id_at(1, segment);
-		REQUIRE(weak_ptr.lock() == nullptr);
+		REQUIRE(weak_ptr.expired());
 	}
+	bpftime_destroy_global_shm();
 }
