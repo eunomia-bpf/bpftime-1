@@ -53,8 +53,8 @@ TEST_CASE("Test helpers probe_read/probe_write_user/probe_read_str", "[helper]")
 	}
 	SECTION("probe write user")
 	{
-		REQUIRE(bpftime_probe_read((uintptr_t)&buf2, sizeof(buf1),
-					   (uintptr_t)&buf1, 0, 0) == 0);
+		REQUIRE(bpftime_probe_write_user((uintptr_t)&buf2, sizeof(buf1),
+						 (uintptr_t)&buf1, 0, 0) == 0);
 	}
 	SECTION("bpf_probe_read_str")
 	{

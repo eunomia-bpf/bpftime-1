@@ -234,27 +234,41 @@ TEST_CASE("Test map handler")
 		{
 			auto rb_ptr = ((uint64_t)1 << 32);
 			std::vector<std::thread> thds;
-			thds.push_back(std::thread([=]() {
-				for (int i = 1; i <= 100; i++) {
-					void *ptr = (void *)(uintptr_t)
-						bpf_ringbuf_reserve(rb_ptr,
-								    sizeof(int),
-								    0, 0, 0);
-					REQUIRE(ptr != nullptr);
-					memcpy(ptr, &i, sizeof(int));
-					if (i % 2 == 0) {
-						// discard it
-						bpf_ringbuf_discard(
-							(uintptr_t)ptr, 0, 0, 0,
-							0);
-					} else {
-						// submit it
-						bpf_ringbuf_submit(
-							(uintptr_t)ptr, 0, 0, 0,
-							0);
+			SECTION("Test with reserve+commit")
+			{
+				thds.push_back(std::thread([=]() {
+					for (int i = 1; i <= 100; i++) {
+						void *ptr = (void *)(uintptr_t)
+							bpf_ringbuf_reserve(
+								rb_ptr,
+								sizeof(int), 0,
+								0, 0);
+						REQUIRE(ptr != nullptr);
+						memcpy(ptr, &i, sizeof(int));
+						if (i % 2 == 0) {
+							// discard it
+							bpf_ringbuf_discard(
+								(uintptr_t)ptr,
+								0, 0, 0, 0);
+						} else {
+							// submit it
+							bpf_ringbuf_submit(
+								(uintptr_t)ptr,
+								0, 0, 0, 0);
+						}
 					}
-				}
-			}));
+				}));
+			}
+			SECTION("Test with output")
+			{
+				thds.push_back(std::thread([=]() {
+					for (int i = 1; i <= 100; i += 2) {
+						bpf_ringbuf_output(
+							rb_ptr, (uintptr_t)&i,
+							sizeof(i), 0, 0);
+					}
+				}));
+			}
 			auto impl = map.try_get_ringbuf_map_impl()
 					    .value()
 					    ->create_impl_shared_ptr();
