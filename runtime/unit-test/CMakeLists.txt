@@ -23,6 +23,7 @@ set(TEST_SOURCES
     maps/test_map_handler.cpp
     maps/test_shared_array_map.cpp
     test_bpftime_shm_json.cpp
+    test_probe.cpp
     attach_with_ebpf/test_attach_filter_with_ebpf.cpp
     attach_with_ebpf/test_attach_uprobe_with_ebpf.cpp
     attach_with_ebpf/test_helpers.cpp
